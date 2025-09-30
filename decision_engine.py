@@ -51,81 +51,110 @@ def high_amount(amount: float, product_type: str, thresholds: Dict[str, Any]) ->
     t = thresholds.get(product_type, thresholds.get("_default"))
     return amount >= t
 
+from typing import Any, Dict, List
+import pandas as pd
+
 def assess_row(row: pd.Series, cfg: Dict[str, Any]) -> Dict[str, Any]:
+
+    # 1) Hard block temprano
+    if _is_hard_block(row, cfg):
+        return {
+            "decision": DECISION_REJECTED,
+            "risk_score": 100,
+            "reasons": "hard_block:chargebacks>=2+ip_high",
+        }
+
     score = 0
     reasons: List[str] = []
 
-    # Hard block: repeated chargebacks + high IP risk
-    if int(row.get("chargeback_count", 0)) >= cfg["chargeback_hard_block"] and str(row.get("ip_risk", "low")).lower() == "high":
-        reasons.append("hard_block:chargebacks>=2+ip_high")
-        return {"decision": DECISION_REJECTED, "risk_score": 100, "reasons": ";".join(reasons)}
+    # 2) Riesgos categóricos (ip/email/device)
+    score += _add_categorical_risks(row, cfg, reasons)
 
-    # Categorical risks
-    for field, mapping in [("ip_risk", cfg["score_weights"]["ip_risk"]),
-                           ("email_risk", cfg["score_weights"]["email_risk"]),
-                           ("device_fingerprint_risk", cfg["score_weights"]["device_fingerprint_risk"])]:
-        val = str(row.get(field, "low")).lower()
-        add = mapping.get(val, 0)
-        score += add
-        if add:
-            reasons.append(f"{field}:{val}(+{add})")
-
-    # Reputation
+    # 3) Reputación
     rep = str(row.get("user_reputation", "new")).lower()
     rep_add = cfg["score_weights"]["user_reputation"].get(rep, 0)
-    score += rep_add
     if rep_add:
+        score += rep_add
         reasons.append(f"user_reputation:{rep}({('+' if rep_add>=0 else '')}{rep_add})")
 
-    # Night hour
+    # 4) Noche
     hr = int(row.get("hour", 12))
     if is_night(hr):
         add = cfg["score_weights"]["night_hour"]
         score += add
         reasons.append(f"night_hour:{hr}(+{add})")
 
-    # Geo mismatch
-    bin_c = str(row.get("bin_country", "")).upper()
-    ip_c  = str(row.get("ip_country", "")).upper()
-    if bin_c and ip_c and bin_c != ip_c:
+    # 5) Geo mismatch
+    if _has_geo_mismatch(row):
         add = cfg["score_weights"]["geo_mismatch"]
         score += add
+        bin_c = str(row.get("bin_country", "")).upper()
+        ip_c  = str(row.get("ip_country", "")).upper()
         reasons.append(f"geo_mismatch:{bin_c}!={ip_c}(+{add})")
 
-    # High amount for product type
-    amount = float(row.get("amount_mxn", 0.0))
-    ptype = str(row.get("product_type", "_default")).lower()
-    if high_amount(amount, ptype, cfg["amount_thresholds"]):
-        add = cfg["score_weights"]["high_amount"]
-        score += add
-        reasons.append(f"high_amount:{ptype}:{amount}(+{add})")
-        if rep == "new":
-            add2 = cfg["score_weights"]["new_user_high_amount"]
-            score += add2
-            reasons.append(f"new_user_high_amount(+{add2})")
+    # 6) Monto alto (+ bono si rep=new)
+    score += _amount_deltas(row, cfg, rep, reasons)
 
-    # Extreme latency
+    # 7) Latencia extrema
     lat = int(row.get("latency_ms", 0))
     if lat >= cfg["latency_ms_extreme"]:
         add = cfg["score_weights"]["latency_extreme"]
         score += add
         reasons.append(f"latency_extreme:{lat}ms(+{add})")
 
-    # Frequency buffer for trusted/recurrent
+    # 8) Buffer de frecuencia
     freq = int(row.get("customer_txn_30d", 0))
     if rep in ("recurrent", "trusted") and freq >= 3 and score > 0:
         score -= 1
         reasons.append("frequency_buffer(-1)")
 
-    # Decision mapping
-    if score >= cfg["score_to_decision"]["reject_at"]:
-        decision = DECISION_REJECTED
-    elif score >= cfg["score_to_decision"]["review_at"]:
-        decision = DECISION_IN_REVIEW
-    else:
-        decision = DECISION_ACCEPTED
-
+    # 9) Decisión
+    decision = _map_decision(score, cfg)
     return {"decision": decision, "risk_score": int(score), "reasons": ";".join(reasons)}
+
+# Helpers
+
+def _is_hard_block(row: pd.Series, cfg: Dict[str, Any]) -> bool:
+    chargebacks = int(row.get("chargeback_count", 0))
+    ip_risk = str(row.get("ip_risk", "low")).lower()
+    return chargebacks >= cfg["chargeback_hard_block"] and ip_risk == "high"
+
+def _add_categorical_risks(row: pd.Series, cfg: Dict[str, Any], reasons: List[str]) -> int:
+    total = 0
+    weights = cfg["score_weights"]
+    for field in ("ip_risk", "email_risk", "device_fingerprint_risk"):
+        val = str(row.get(field, "low")).lower()
+        add = weights[field].get(val, 0)
+        if add:
+            total += add
+            reasons.append(f"{field}:{val}(+{add})")
+    return total
+
+def _has_geo_mismatch(row: pd.Series) -> bool:
+    bin_c = str(row.get("bin_country", "")).upper()
+    ip_c  = str(row.get("ip_country", "")).upper()
+    return bool(bin_c and ip_c and bin_c != ip_c)
+
+def _amount_deltas(row: pd.Series, cfg: Dict[str, Any], rep: str, reasons: List[str]) -> int:
+    amount = float(row.get("amount_mxn", 0.0))
+    ptype = str(row.get("product_type", "_default")).lower()
+    total = 0
+    if high_amount(amount, ptype, cfg["amount_thresholds"]):
+        add = cfg["score_weights"]["high_amount"]
+        total += add
+        reasons.append(f"high_amount:{ptype}:{amount}(+{add})")
+        if rep == "new":
+            add2 = cfg["score_weights"]["new_user_high_amount"]
+            total += add2
+            reasons.append(f"new_user_high_amount(+{add2})")
+    return total
+
+def _map_decision(score: int, cfg: Dict[str, Any]) -> str:
+    if score >= cfg["score_to_decision"]["reject_at"]:
+        return DECISION_REJECTED
+    if score >= cfg["score_to_decision"]["review_at"]:
+        return DECISION_IN_REVIEW
+    return DECISION_ACCEPTED
 
 def run(input_csv: str, output_csv: str, config: Dict[str, Any] = None) -> pd.DataFrame:
     cfg = config or DEFAULT_CONFIG
