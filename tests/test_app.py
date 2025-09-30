@@ -83,3 +83,14 @@ def test_transaction_hard_block_rejection():
     data = r.json()
     assert data["transaction_id"] == 99
     assert data["decision"] == "REJECTED"
+
+def test_version_endpoint():
+    """The version endpoint should return service name and version."""
+    r = client.get("/version")
+    assert r.status_code == 200
+    payload = r.json()
+    assert "service" in payload
+    assert "version" in payload
+    assert payload["service"] == "CNP Decision Service"
+    assert payload["version"] == "1.0.0"
+

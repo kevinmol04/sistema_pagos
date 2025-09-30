@@ -61,3 +61,7 @@ def evaluate_transaction(txn: Transaction):
         "risk_score": int(res["risk_score"]),
         "reasons": res.get("reasons", ""),
     }
+
+@app.get("/version")
+def version():
+    return {"service": app.title, "version": app.version} # type: ignore
